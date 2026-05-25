@@ -12,7 +12,6 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-// --- Types ---
 interface Player {
   id: number;
   name: string;
@@ -87,7 +86,6 @@ interface HistoryItem {
   date: string;
 }
 
-// --- Utils ---
 const hexToDecimal = (s: string) => {
   let i, j, digits = [0], carry;
   for (i = 0; i < s.length; i += 1) {
@@ -114,9 +112,7 @@ const parseIdentifiers = (ids: string[]) => {
     xbl: undefined,
     raw: ids || []
   };
-  
   if (!ids || !Array.isArray(ids)) return result;
-
   ids.forEach(id => {
     if (id.includes('steam:')) result.steamId = id.replace('steam:', '');
     if (id.includes('discord:')) result.discordId = id.replace('discord:', '');
@@ -127,7 +123,26 @@ const parseIdentifiers = (ids: string[]) => {
   return result;
 };
 
-// --- Components ---
+const fetchWithFallbacks = async (targetUrl: string) => {
+  try {
+    const backendRes = await fetch(`/api/fivem?url=${encodeURIComponent(targetUrl)}&cache=${Date.now()}`);
+    if (backendRes.ok) return backendRes;
+  } catch (e) {
+    console.warn('Saját backend nem elérhető, próbálkozás proxykkal...');
+  }
+  const proxyList = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`
+  ];
+  for (const pUrl of proxyList) {
+    try {
+      const res = await fetch(pUrl);
+      if (res.ok) return res;
+    } catch (e) {}
+  }
+  throw new Error('Sikertelen kapcsolódás.');
+};
+
 const Card = ({ children, className }: { children: React.ReactNode; className?: string }) => (
   <div className={cn("bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-sm", className)}>
     {children}
@@ -184,28 +199,56 @@ export default function App() {
   }, []);
 
   const fetchServerData = async (id: string, isSilentRefresh = false) => {
-    // FONTOS: Ezt a részt írd át a saját szervered IP-jére és portjára!
-    // A /szaby-api/players a resource nevéből és a lua fájlban lévő útvonalból adódik össze.
-    const customApiUrl = `http://1.2.3.4:30120/szaby-api/players?v=${Date.now()}`;
-
+    if (!id) return;
+    const cleanId = id.trim();
     if (!isSilentRefresh) setLoading(true);
     setError(null);
 
+    const cacheBuster = `?v=${Date.now()}`;
+    const targetUrl = `https://servers-frontend.fivem.net/api/servers/single/${cleanId}${cacheBuster}`;
+
     try {
-      // Saját Express proxy-dat használjuk a CORS hiba elkerülésére
-      const res = await fetch(`/api/fivem?url=${encodeURIComponent(customApiUrl)}`);
+      // 1. LEKÉRÉS: Alapadatok a FiveM hivatalos API-jától
+      const res = await fetchWithFallbacks(targetUrl);
+      const text = await res.text();
       
-      if (!res.ok) throw new Error('Szerver nem elérhető. Ellenőrizd az IP címet és hogy fut-e a szaby-api resource!');
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        const jsonMatch = text.match(/\{[\s\S]*"Data"[\s\S]*\}/);
+        if (jsonMatch) json = JSON.parse(jsonMatch[0]);
+        else throw new Error('Nem sikerült feldolgozni a szerver válaszát.');
+      }
       
-      const rawPlayers = await res.json();
-      
-      if (Array.isArray(rawPlayers)) {
-        console.log("✓ Egyedi API betöltve, azonosítók rendben!");
+      if (json?.Data) {
+        const data = json.Data;
+        const rawHostname = data.hostname || 'Ismeretlen Szerver';
+        const hostname = rawHostname.replace(/\^\d/g, '').trim();
         
-        const formattedPlayers = rawPlayers.map((p: any, idx: number) => {
+        let iconUrl = `https://servers-live.fivem.net/servers/icon/${cleanId}/${data.iconVersion}.png`;
+        if (!data.iconVersion) iconUrl = 'https://fivem.net/favicon.png';
+
+        setServerInfo({
+          hostname,
+          clients: data.clients || 0,
+          maxClients: data.svMaxclients || data.sv_maxclients || 0,
+          iconUrl,
+          bannerUrl: data.vars?.banner_detail || data.vars?.banner_connecting,
+          bannerConnectingUrl: data.vars?.banner_connecting,
+          mapName: data.mapname,
+          gametype: data.gametype,
+          version: data.server,
+          tags: data.vars?.tags?.split(',') || [],
+          ownerName: data.ownerName,
+          ownerProfile: data.ownerProfile,
+          resources: data.resources || []
+        });
+
+        // Alap, cenzúrázott játékoslista betöltése
+        let formattedPlayers = (data.players || []).map((p: any, idx: number) => {
           const pIdentifiers = Array.isArray(p.identifiers) ? p.identifiers : [];
           const parsedIds = parseIdentifiers(pIdentifiers);
-          
           return {
             id: p.id || 0,
             name: p.name || 'Ismeretlen',
@@ -221,29 +264,55 @@ export default function App() {
           };
         }).sort((a: any, b: any) => a.id - b.id);
 
-        setPlayers(formattedPlayers);
-        
-        // Mivel most nem a Cfx API-t hívjuk, a szerver infókat kézzel állítjuk be
-        setServerInfo({
-          hostname: "Saját RP Szerverünk",
-          clients: formattedPlayers.length,
-          maxClients: 64, // Ezt is átírhatod a szervered limitjére
-          iconUrl: 'https://fivem.net/favicon.png', // Ide jöhet a saját logód URL-je
-        });
+        // 2. LEKÉRÉS: Agresszív Spoofing a saját backendünkön keresztül a rejtett adatokért
+        if (data.connectEndPoints && data.connectEndPoints.length > 0) {
+          try {
+            const serverIp = data.connectEndPoints[0];
+            const directUrl = `http://${serverIp}/players.json`;
+            console.log(`Bypass kísérlet a közvetlen IP-n: ${directUrl}`);
+            
+            // Itt a backendünk CitizenFX kliensnek hazudja magát!
+            const directRes = await fetch(`/api/fivem?url=${encodeURIComponent(directUrl)}`);
+            
+            if (directRes.ok) {
+              const directPlayers = await directRes.json();
+              if (Array.isArray(directPlayers) && directPlayers.length > 0) {
+                console.log("🔥 Bypass sikeres! Rejtett azonosítók betöltve.");
+                
+                // Kicseréljük az üres azonosítókat a kinyert adatokra
+                formattedPlayers = directPlayers.map((p: any, idx: number) => {
+                  const pIdentifiers = Array.isArray(p.identifiers) ? p.identifiers : [];
+                  const parsedIds = parseIdentifiers(pIdentifiers);
+                  return {
+                    id: p.id || 0,
+                    name: p.name || 'Ismeretlen',
+                    ping: p.ping || 0,
+                    identifiers: pIdentifiers,
+                    steamId: parsedIds.steamId,
+                    discordId: parsedIds.discordId,
+                    license: parsedIds.license,
+                    live: parsedIds.live,
+                    xbl: parsedIds.xbl,
+                    steamId64: parsedIds.steamId ? hexToDecimal(parsedIds.steamId) : undefined,
+                    key: pIdentifiers[0] || `player-${p.id}-${idx}`
+                  };
+                }).sort((a: any, b: any) => a.id - b.id);
+              }
+            }
+          } catch (err) {
+            console.warn("A Bypass kísérlet nem sikerült.", err);
+          }
+        }
 
-        setCurrentServerId('custom-server');
-        
-        // Előzmények mentése a saját szerverhez
+        setPlayers(formattedPlayers);
+        setCurrentServerId(cleanId);
+        localStorage.setItem('lastServerId', cleanId);
         setHistory(prev => {
-          const filtered = prev.filter(h => h.id !== 'custom-server');
-          return [{ id: 'custom-server', name: 'Saját RP Szerverünk', icon: 'https://fivem.net/favicon.png', date: new Date().toISOString() }, ...filtered].slice(0, 8);
+          const filtered = prev.filter(h => h.id !== cleanId);
+          return [{ id: cleanId, name: hostname, icon: iconUrl, date: new Date().toISOString() }, ...filtered].slice(0, 8);
         });
-      } else {
-         throw new Error('Hibás adat jött a szervertől');
       }
-      
     } catch (err: any) {
-      console.error(err);
       setError(err.message);
     } finally {
       setLoading(false);
@@ -270,7 +339,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-[#0b0f1a] text-slate-900 dark:text-slate-100 font-sans selection:bg-blue-500/30 transition-colors duration-300">
-      {/* Navbar */}
       <nav className="sticky top-0 z-50 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800">
         <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between gap-4">
           <div className="flex items-center gap-2 cursor-pointer" onClick={() => window.location.reload()}>
@@ -279,7 +347,6 @@ export default function App() {
             </div>
             <span className="font-black text-xl tracking-tight hidden sm:block">FIVEM<span className="text-blue-600">EXPLORER</span></span>
           </div>
-
           <div className="flex-1 max-w-md relative group">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-blue-500 transition-colors" size={18} />
             <form onSubmit={(e) => { e.preventDefault(); fetchServerData(serverIdInput); }}>
@@ -287,12 +354,11 @@ export default function App() {
                 type="text"
                 value={serverIdInput}
                 onChange={(e) => setServerIdInput(e.target.value)}
-                placeholder="Csatlakozás saját szerverhez..."
+                placeholder="Szerver ID (pl. vp4rxq)"
                 className="w-full bg-slate-100 dark:bg-slate-800 border-none rounded-xl py-2.5 pl-10 pr-4 focus:ring-2 focus:ring-blue-500 transition-all text-sm font-medium"
               />
             </form>
           </div>
-
           <div className="flex items-center gap-2">
             <button 
               onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
@@ -422,16 +488,19 @@ export default function App() {
               </div>
               <div>
                 <h2 className="text-2xl font-black">Nincs kiválasztott szerver</h2>
-                <p className="text-slate-500 mt-2 max-w-xs">Kattints a keresés gombra a saját API csatlakozásához.</p>
+                <p className="text-slate-500 mt-2 max-w-xs">Adj meg egy FiveM Szerver ID-t a fenti keresőben a részletek megtekintéséhez.</p>
               </div>
               <div className="flex flex-wrap justify-center gap-2">
-                <button 
-                  onClick={() => { fetchServerData('custom-server'); }}
-                  className="flex items-center gap-2 px-4 py-2 bg-blue-500 border border-blue-600 rounded-xl hover:bg-blue-600 transition-colors text-white"
-                >
-                  <Server className="w-5 h-5" />
-                  <span className="text-sm font-bold">Saját Szerver Betöltése</span>
-                </button>
+                {history.map(srv => (
+                  <button 
+                    key={srv.id}
+                    onClick={() => { setServerIdInput(srv.id); fetchServerData(srv.id); }}
+                    className="flex items-center gap-2 px-4 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl hover:border-blue-500 transition-colors"
+                  >
+                    <img src={srv.icon} className="w-5 h-5 rounded-md" alt="" />
+                    <span className="text-sm font-bold">{srv.name}</span>
+                  </button>
+                ))}
               </div>
             </motion.div>
           )}
@@ -502,7 +571,7 @@ export default function App() {
                         <AlertCircle size={14} />
                         {players.some(p => p.identifiers && p.identifiers.length > 0)
                           ? `AZONOSÍTÓK BETÖLTVE: ${players.filter(p => p.identifiers?.length > 0).length}/${players.length} játékos`
-                          : "A SZERVER ELREJTI AZ AZONOSÍTÓKAT - Ez szerver beállítás, nem hiba"
+                          : "A SZERVER ELREJTI AZ AZONOSÍTÓKAT - Még a Bypass sem segített."
                         }
                       </div>
                     )}
