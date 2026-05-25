@@ -32,8 +32,9 @@ app.get('/api/fivem', async (req, res) => {
   }
 });
 
-// JAVÍTOTT ÚTVONAL: Express 5 kompatibilis minden kérést elkapó route
-app.get('/:any*', (req, res) => {
+// VÉGLEGES JAVÍTÁS: Express 5 kompatibilis catch-all
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api')) return next();
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
