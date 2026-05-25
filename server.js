@@ -46,7 +46,7 @@ app.get('/api/fivem', async (req, res) => {
 });
 
 // Minden más kérésre a React appot adjuk vissza
-app.get('*', (req, res) => {
+app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
