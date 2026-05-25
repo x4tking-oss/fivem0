@@ -130,17 +130,15 @@ const parseIdentifiers = (ids: string[]) => {
 const fetchWithFallbacks = async (targetUrl: string) => {
   // RENDER BACKEND ELSŐBBSÉG
   try {
-    // Renderen a /api/fivem a saját backendünket hívja
     const backendRes = await fetch(`/api/fivem?url=${encodeURIComponent(targetUrl)}&cache=${Date.now()}`);
     if (backendRes.ok) {
-      console.log('✓ Adatok lekérve saját backendről');
       return backendRes;
     }
   } catch (e) {
     console.warn('Saját backend nem elérhető, próbálkozás proxykkal...');
   }
 
-  // TARTALÉK PROXYK (ha még nem fut a backend)
+  // TARTALÉK PROXYK
   const proxyList = [
     `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
     `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`
@@ -157,14 +155,11 @@ const fetchWithFallbacks = async (targetUrl: string) => {
 };
 
 // --- Components ---
-
 const Card = ({ children, className }: { children: React.ReactNode; className?: string }) => (
   <div className={cn("bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-sm", className)}>
     {children}
   </div>
 );
-
-
 
 export default function App() {
   const [serverIdInput, setServerIdInput] = useState('');
@@ -225,7 +220,6 @@ export default function App() {
     const targetUrl = `https://servers-frontend.fivem.net/api/servers/single/${cleanId}${cacheBuster}`;
 
     try {
-      // Megpróbáljuk több proxyval, hátha az egyik nem szűri az adatokat
       const res = await fetchWithFallbacks(targetUrl);
       const text = await res.text();
       
@@ -241,8 +235,6 @@ export default function App() {
       if (json?.Data) {
         const data = json.Data;
         
-        // RV Legacy és más szervereknél a hostname tartalmazza a színeket (^1, ^2, stb.)
-        // Tisztítsuk meg alaposabban
         const rawHostname = data.hostname || 'Ismeretlen Szerver';
         const hostname = rawHostname.replace(/\^\d/g, '').trim();
         
@@ -265,14 +257,10 @@ export default function App() {
           resources: data.resources || []
         });
 
-        const formattedPlayers = (data.players || []).map((p: any, idx: number) => {
+        // 1. Lépés: Játékosok inicializálása az alap adatokkal
+        let formattedPlayers = (data.players || []).map((p: any, idx: number) => {
           const pIdentifiers = Array.isArray(p.identifiers) ? p.identifiers : [];
           const parsedIds = parseIdentifiers(pIdentifiers);
-          
-          // DEBUG az első 3 játékosra
-          if (idx < 3 && pIdentifiers.length > 0) {
-            console.log(`Játékos ${p.name}:`, pIdentifiers);
-          }
           
           return {
             id: p.id || 0,
@@ -288,10 +276,49 @@ export default function App() {
             key: pIdentifiers[0] || `player-${p.id}-${idx}`
           };
         }).sort((a: any, b: any) => a.id - b.id);
-        
-        // Logoljuk hány játékosnak van azonosítója
+
+        // 2. Lépés (ÚJ RÉSZ): Ha kapunk közvetlen IP-t, lekérjük a teljes json-t
+        if (data.connectEndPoints && data.connectEndPoints.length > 0) {
+          try {
+            const serverIp = data.connectEndPoints[0]; // pl. 192.168.1.1:30120
+            const directUrl = `http://${serverIp}/players.json`;
+            
+            // A te Express backendet használjuk proxyként, így nincs CORS hiba!
+            const directRes = await fetchWithFallbacks(directUrl);
+            
+            if (directRes.ok) {
+              const directPlayers = await directRes.json();
+              
+              if (Array.isArray(directPlayers) && directPlayers.length > 0) {
+                console.log("✓ Közvetlen players.json sikeresen betöltve, azonosítók frissítve!");
+                
+                // Felülírjuk az eredeti, hiányos listát az IP-ről kapott részletes adatokkal
+                formattedPlayers = directPlayers.map((p: any, idx: number) => {
+                  const pIdentifiers = Array.isArray(p.identifiers) ? p.identifiers : [];
+                  const parsedIds = parseIdentifiers(pIdentifiers);
+                  return {
+                    id: p.id || 0,
+                    name: p.name || 'Ismeretlen',
+                    ping: p.ping || 0,
+                    identifiers: pIdentifiers,
+                    steamId: parsedIds.steamId,
+                    discordId: parsedIds.discordId,
+                    license: parsedIds.license,
+                    live: parsedIds.live,
+                    xbl: parsedIds.xbl,
+                    steamId64: parsedIds.steamId ? hexToDecimal(parsedIds.steamId) : undefined,
+                    key: pIdentifiers[0] || `player-${p.id}-${idx}`
+                  };
+                }).sort((a: any, b: any) => a.id - b.id);
+              }
+            }
+          } catch (err) {
+            console.warn("A közvetlen IP lekérés nem sikerült, marad az alap adat.", err);
+          }
+        }
+
         const withIds = formattedPlayers.filter((p: Player) => p.identifiers.length > 0).length;
-        console.log(`Összesen ${formattedPlayers.length} játékos, ${withIds} rendelkezik azonosítókkal`);
+        console.log(`Összesen ${formattedPlayers.length} játékos, ebből ${withIds} rendelkezik azonosítókkal`);
 
         setPlayers(formattedPlayers);
         setCurrentServerId(cleanId);
@@ -326,8 +353,6 @@ export default function App() {
       return [...prev, { key: player.key, name: player.name, id: player.id }];
     });
   };
-
-
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-[#0b0f1a] text-slate-900 dark:text-slate-100 font-sans selection:bg-blue-500/30 transition-colors duration-300">
@@ -366,7 +391,6 @@ export default function App() {
       </nav>
 
       <main className="max-w-7xl mx-auto px-4 py-8 space-y-8">
-        {/* Hero Section / Server Info */}
         <AnimatePresence mode="wait">
           {serverInfo ? (
             <motion.div 
@@ -376,7 +400,6 @@ export default function App() {
               className="grid grid-cols-1 lg:grid-cols-3 gap-6"
             >
               <Card className="lg:col-span-2 overflow-hidden relative group min-h-[420px] border-none shadow-2xl flex flex-col justify-end bg-slate-950 rounded-[2.5rem]">
-                {/* Modern Dynamic Background */}
                 <div className="absolute inset-0 z-0">
                   <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-slate-950/60 to-transparent z-10" />
                   <motion.div 
@@ -558,7 +581,6 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }} 
                     exit={{ opacity: 0, x: -20 }}
                   >
-                    {/* Identifier Availability Check */}
                     {players.length > 0 && (
                       <div className={cn(
                         "p-3 border-b text-xs font-bold flex items-center gap-2",
@@ -574,7 +596,6 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* Desktop View */}
                     <div className="hidden lg:block overflow-x-auto">
                       <table className="w-full text-left border-collapse">
                         <thead>
@@ -589,7 +610,6 @@ export default function App() {
                         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                           {filteredPlayers.length > 0 ? filteredPlayers.map((player) => {
                             const isFav = favorites.some(f => f.key === player.key);
-                            // Cast player to include steamId64 since we added it in formattedPlayers
                             const p = player as any;
                             return (
                               <tr key={player.id} className="group hover:bg-slate-50 dark:hover:bg-slate-800/30 transition-colors">
@@ -633,7 +653,6 @@ export default function App() {
                       </table>
                     </div>
 
-                    {/* Mobile View */}
                     <div className="lg:hidden divide-y divide-slate-100 dark:divide-slate-800">
                       {filteredPlayers.length > 0 ? filteredPlayers.map((player) => {
                         const isFav = favorites.some(f => f.key === player.key);
@@ -786,7 +805,6 @@ export default function App() {
         )}
       </main>
 
-      {/* Footer */}
       <footer className="max-w-7xl mx-auto px-4 py-12 text-center">
         <div className="h-px bg-gradient-to-r from-transparent via-slate-200 dark:via-slate-800 to-transparent mb-8" />
         <p className="text-xs text-slate-400 dark:text-slate-500 mb-6 uppercase tracking-[0.2em] font-bold">
