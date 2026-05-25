@@ -127,33 +127,6 @@ const parseIdentifiers = (ids: string[]) => {
   return result;
 };
 
-const fetchWithFallbacks = async (targetUrl: string) => {
-  // RENDER BACKEND ELSŐBBSÉG
-  try {
-    const backendRes = await fetch(`/api/fivem?url=${encodeURIComponent(targetUrl)}&cache=${Date.now()}`);
-    if (backendRes.ok) {
-      return backendRes;
-    }
-  } catch (e) {
-    console.warn('Saját backend nem elérhető, próbálkozás proxykkal...');
-  }
-
-  // TARTALÉK PROXYK
-  const proxyList = [
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`
-  ];
-  
-  for (const pUrl of proxyList) {
-    try {
-      const res = await fetch(pUrl);
-      if (res.ok) return res;
-    } catch (e) {}
-  }
-  
-  throw new Error('Sikertelen kapcsolódás.');
-};
-
 // --- Components ---
 const Card = ({ children, className }: { children: React.ReactNode; className?: string }) => (
   <div className={cn("bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-sm", className)}>
@@ -211,54 +184,25 @@ export default function App() {
   }, []);
 
   const fetchServerData = async (id: string, isSilentRefresh = false) => {
-    if (!id) return;
-    const cleanId = id.trim();
+    // FONTOS: Ezt a részt írd át a saját szervered IP-jére és portjára!
+    // A /szaby-api/players a resource nevéből és a lua fájlban lévő útvonalból adódik össze.
+    const customApiUrl = `http://1.2.3.4:30120/szaby-api/players?v=${Date.now()}`;
+
     if (!isSilentRefresh) setLoading(true);
     setError(null);
 
-    const cacheBuster = `?v=${Date.now()}`;
-    const targetUrl = `https://servers-frontend.fivem.net/api/servers/single/${cleanId}${cacheBuster}`;
-
     try {
-      const res = await fetchWithFallbacks(targetUrl);
-      const text = await res.text();
+      // Saját Express proxy-dat használjuk a CORS hiba elkerülésére
+      const res = await fetch(`/api/fivem?url=${encodeURIComponent(customApiUrl)}`);
       
-      let json;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        const jsonMatch = text.match(/\{[\s\S]*"Data"[\s\S]*\}/);
-        if (jsonMatch) json = JSON.parse(jsonMatch[0]);
-        else throw new Error('Nem sikerült feldolgozni a szerver válaszát.');
-      }
+      if (!res.ok) throw new Error('Szerver nem elérhető. Ellenőrizd az IP címet és hogy fut-e a szaby-api resource!');
       
-      if (json?.Data) {
-        const data = json.Data;
+      const rawPlayers = await res.json();
+      
+      if (Array.isArray(rawPlayers)) {
+        console.log("✓ Egyedi API betöltve, azonosítók rendben!");
         
-        const rawHostname = data.hostname || 'Ismeretlen Szerver';
-        const hostname = rawHostname.replace(/\^\d/g, '').trim();
-        
-        let iconUrl = `https://servers-live.fivem.net/servers/icon/${cleanId}/${data.iconVersion}.png`;
-        if (!data.iconVersion) iconUrl = 'https://fivem.net/favicon.png';
-
-        setServerInfo({
-          hostname,
-          clients: data.clients || 0,
-          maxClients: data.svMaxclients || data.sv_maxclients || 0,
-          iconUrl,
-          bannerUrl: data.vars?.banner_detail || data.vars?.banner_connecting,
-          bannerConnectingUrl: data.vars?.banner_connecting,
-          mapName: data.mapname,
-          gametype: data.gametype,
-          version: data.server,
-          tags: data.vars?.tags?.split(',') || [],
-          ownerName: data.ownerName,
-          ownerProfile: data.ownerProfile,
-          resources: data.resources || []
-        });
-
-        // 1. Lépés: Játékosok inicializálása az alap adatokkal
-        let formattedPlayers = (data.players || []).map((p: any, idx: number) => {
+        const formattedPlayers = rawPlayers.map((p: any, idx: number) => {
           const pIdentifiers = Array.isArray(p.identifiers) ? p.identifiers : [];
           const parsedIds = parseIdentifiers(pIdentifiers);
           
@@ -277,59 +221,29 @@ export default function App() {
           };
         }).sort((a: any, b: any) => a.id - b.id);
 
-        // 2. Lépés (ÚJ RÉSZ): Ha kapunk közvetlen IP-t, lekérjük a teljes json-t
-        if (data.connectEndPoints && data.connectEndPoints.length > 0) {
-          try {
-            const serverIp = data.connectEndPoints[0]; // pl. 192.168.1.1:30120
-            const directUrl = `http://${serverIp}/players.json`;
-            
-            // A te Express backendet használjuk proxyként, így nincs CORS hiba!
-            const directRes = await fetchWithFallbacks(directUrl);
-            
-            if (directRes.ok) {
-              const directPlayers = await directRes.json();
-              
-              if (Array.isArray(directPlayers) && directPlayers.length > 0) {
-                console.log("✓ Közvetlen players.json sikeresen betöltve, azonosítók frissítve!");
-                
-                // Felülírjuk az eredeti, hiányos listát az IP-ről kapott részletes adatokkal
-                formattedPlayers = directPlayers.map((p: any, idx: number) => {
-                  const pIdentifiers = Array.isArray(p.identifiers) ? p.identifiers : [];
-                  const parsedIds = parseIdentifiers(pIdentifiers);
-                  return {
-                    id: p.id || 0,
-                    name: p.name || 'Ismeretlen',
-                    ping: p.ping || 0,
-                    identifiers: pIdentifiers,
-                    steamId: parsedIds.steamId,
-                    discordId: parsedIds.discordId,
-                    license: parsedIds.license,
-                    live: parsedIds.live,
-                    xbl: parsedIds.xbl,
-                    steamId64: parsedIds.steamId ? hexToDecimal(parsedIds.steamId) : undefined,
-                    key: pIdentifiers[0] || `player-${p.id}-${idx}`
-                  };
-                }).sort((a: any, b: any) => a.id - b.id);
-              }
-            }
-          } catch (err) {
-            console.warn("A közvetlen IP lekérés nem sikerült, marad az alap adat.", err);
-          }
-        }
-
-        const withIds = formattedPlayers.filter((p: Player) => p.identifiers.length > 0).length;
-        console.log(`Összesen ${formattedPlayers.length} játékos, ebből ${withIds} rendelkezik azonosítókkal`);
-
         setPlayers(formattedPlayers);
-        setCurrentServerId(cleanId);
-        localStorage.setItem('lastServerId', cleanId);
         
-        setHistory(prev => {
-          const filtered = prev.filter(h => h.id !== cleanId);
-          return [{ id: cleanId, name: hostname, icon: iconUrl, date: new Date().toISOString() }, ...filtered].slice(0, 8);
+        // Mivel most nem a Cfx API-t hívjuk, a szerver infókat kézzel állítjuk be
+        setServerInfo({
+          hostname: "Saját RP Szerverünk",
+          clients: formattedPlayers.length,
+          maxClients: 64, // Ezt is átírhatod a szervered limitjére
+          iconUrl: 'https://fivem.net/favicon.png', // Ide jöhet a saját logód URL-je
         });
+
+        setCurrentServerId('custom-server');
+        
+        // Előzmények mentése a saját szerverhez
+        setHistory(prev => {
+          const filtered = prev.filter(h => h.id !== 'custom-server');
+          return [{ id: 'custom-server', name: 'Saját RP Szerverünk', icon: 'https://fivem.net/favicon.png', date: new Date().toISOString() }, ...filtered].slice(0, 8);
+        });
+      } else {
+         throw new Error('Hibás adat jött a szervertől');
       }
+      
     } catch (err: any) {
+      console.error(err);
       setError(err.message);
     } finally {
       setLoading(false);
@@ -373,7 +287,7 @@ export default function App() {
                 type="text"
                 value={serverIdInput}
                 onChange={(e) => setServerIdInput(e.target.value)}
-                placeholder="Szerver ID (pl. vp4rxq)"
+                placeholder="Csatlakozás saját szerverhez..."
                 className="w-full bg-slate-100 dark:bg-slate-800 border-none rounded-xl py-2.5 pl-10 pr-4 focus:ring-2 focus:ring-blue-500 transition-all text-sm font-medium"
               />
             </form>
@@ -508,19 +422,16 @@ export default function App() {
               </div>
               <div>
                 <h2 className="text-2xl font-black">Nincs kiválasztott szerver</h2>
-                <p className="text-slate-500 mt-2 max-w-xs">Adj meg egy FiveM Szerver ID-t a fenti keresőben a részletek megtekintéséhez.</p>
+                <p className="text-slate-500 mt-2 max-w-xs">Kattints a keresés gombra a saját API csatlakozásához.</p>
               </div>
               <div className="flex flex-wrap justify-center gap-2">
-                {history.map(srv => (
-                  <button 
-                    key={srv.id}
-                    onClick={() => { setServerIdInput(srv.id); fetchServerData(srv.id); }}
-                    className="flex items-center gap-2 px-4 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl hover:border-blue-500 transition-colors"
-                  >
-                    <img src={srv.icon} className="w-5 h-5 rounded-md" alt="" />
-                    <span className="text-sm font-bold">{srv.name}</span>
-                  </button>
-                ))}
+                <button 
+                  onClick={() => { fetchServerData('custom-server'); }}
+                  className="flex items-center gap-2 px-4 py-2 bg-blue-500 border border-blue-600 rounded-xl hover:bg-blue-600 transition-colors text-white"
+                >
+                  <Server className="w-5 h-5" />
+                  <span className="text-sm font-bold">Saját Szerver Betöltése</span>
+                </button>
               </div>
             </motion.div>
           )}
