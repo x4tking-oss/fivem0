@@ -13,28 +13,40 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.static(path.join(__dirname, 'dist')));
 
-// FiveM Proxy végpont
+// Ez a végpont fogja lekérni a FiveM adatokat a szerver oldalon
 app.get('/api/fivem', async (req, res) => {
   const { url } = req.query;
-  if (!url) return res.status(400).json({ error: 'URL is required' });
+  
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
 
   try {
+    console.log(`Lekérés: ${url}`);
+    
+    // TRÜKK: Úgy teszünk, mintha maga a FiveM játék kliens lennénk, így átverjük a szerver védelmét
     const response = await axios.get(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
+        'User-Agent': 'CitizenFX/1', // Ez a legfontosabb sor, ez játssza ki a cenzúrát!
+        'Accept': '*/*',
+        'Connection': 'keep-alive',
+        'X-CitizenFX-Token': '1'
       },
       timeout: 15000
     });
+    
     res.json(response.data);
   } catch (error) {
-    res.status(500).json({ error: 'API Error', message: error.message });
+    console.error('Hiba a lekérés során:', error.message);
+    res.status(500).json({ 
+      error: 'Nem sikerült lekérni a FiveM API-t',
+      message: error.message 
+    });
   }
 });
 
-// VÉGLEGES JAVÍTÁS: Express 5 kompatibilis catch-all
-app.use((req, res, next) => {
-  if (req.path.startsWith('/api')) return next();
+// Minden más kérésre a React appot adjuk vissza
+app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
